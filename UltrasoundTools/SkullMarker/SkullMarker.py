@@ -1,5 +1,7 @@
 import os
 import vtk, qt, ctk, slicer
+import math
+import numpy as np
 from slicer.ScriptedLoadableModule import *
 import logging
 
@@ -101,6 +103,15 @@ class SkullMarkerWidget(ScriptedLoadableModuleWidget):
     inputsFormLayout.addRow("Number of scanlines: ", self.scanlineNumber)
 
     #
+    # Minimum Distance between points
+    #
+    self.minimumDistanceBetweenPointsMM = qt.QSpinBox()
+    self.minimumDistanceBetweenPointsMM.setMinimum(2)
+    self.minimumDistanceBetweenPointsMM.setSingleStep(1)
+    self.minimumDistanceBetweenPointsMM.setSuffix(" mm")
+    inputsFormLayout.addRow("Minimum distance between points: ", self.minimumDistanceBetweenPointsMM)
+
+    #
     # Starting depth for fiducial placement
     #
     self.startingDepthMM = qt.QSpinBox()
@@ -170,6 +181,7 @@ class SkullMarkerWidget(ScriptedLoadableModuleWidget):
     self.startingDepthMM.connect('valueChanged(int)', self.validateStartingDepth)
     self.endingDepthMM.connect('valueChanged(int)', self.validateEndingDepth)
     self.thresholdSlider.connect('valueChanged(double)', self.setThreshold)
+    self.minimumDistanceBetweenPointsMM.connect('valueChanged(double)', self.validateMinimumDistance)
 
     # Add vertical spacer
     self.layout.addStretch(1)
@@ -220,6 +232,8 @@ class SkullMarkerWidget(ScriptedLoadableModuleWidget):
     self.logic.setFiducialNode(selectedFiducialNode)
     self.logic.setMinMaxDepth(self.startingDepthMM.value, self.endingDepthMM.value)
     self.logic.setThreshold(self.thresholdSlider.value)
+    self.logic.setMinimumDistanceBetween(self.minimumDistanceBetweenPointsMM.value)
+    self.logic.setFiducialArray()
 
     # Validate the number of scanlines
     if (self.scanlineNumber.value > self.logic.usGeometryLogic.numberOfScanlines):
@@ -242,7 +256,7 @@ class SkullMarkerWidget(ScriptedLoadableModuleWidget):
 
 
   def onConfigureParametersButton(self):
-    logic = SkullMarkerLogic(self.configFile.text, self.inputSelector.currentNode(), self.fiducialSelector.currentNode(), self.startingDepthMM.value, self.endingDepthMM.value)
+    logic = SkullMarkerLogic(self.configFile.text, self.inputSelector.currentNode(), self.fiducialSelector.currentNode(), self.startingDepthMM.value, self.endingDepthMM.value, self.minimumDistanceBetweenPointsMM.value)
 
     if (SkullMarkerLogic.configuring == 0): # Configuring off, so begin configuration
       SkullMarkerLogic.configuring = 1
@@ -274,6 +288,10 @@ class SkullMarkerWidget(ScriptedLoadableModuleWidget):
   def setThreshold(self):
     SkullMarkerLogic.threshold = self.thresholdSlider.value
 
+  def validateMinimumDistance(self):
+    if (self.minimumDistanceBetweenPointsMM.value < 0):
+      slicer.util.warningDisplay("The minimum distance between points must be larger than 0mm.")
+      self.minimumDistanceBetweenPointsMM.setValue(2)
 
   def updateGui(self):
     readyToRun = True
@@ -309,6 +327,8 @@ class SkullMarkerLogic(ScriptedLoadableModuleLogic):
     self.minDepthMm = 0
     self.maxDepthMm = 0
     self.threshold = 200
+    self.minDistanceBetween = 0
+    self.fiducialArray = None
 
     self.volumeModifiedObserverTag = None
 
@@ -339,14 +359,18 @@ class SkullMarkerLogic(ScriptedLoadableModuleLogic):
       return
     self.fiducialNodeId = fiducialNode.GetID()
 
-
   def setMinMaxDepth(self, minDepthMm, maxDepthMm):
     self.minDepthMm = minDepthMm
     self.maxDepthMm = maxDepthMm
 
+  def setMinimumDistanceBetween(self,minDistanceBewteen):
+    self.minDistanceBetween = minDistanceBewteen
 
   def setThreshold(self, t):
     self.threshold = t
+
+  def setFiducialArray(self):
+    self.fiducialArray = None
 
   def computeFiducialScanlines(self, scanlineNumber):
     # Find the middle scanline which will always be used
@@ -420,6 +444,9 @@ class SkullMarkerLogic(ScriptedLoadableModuleLogic):
       logging.error('Fiducial node not found!')
       return
 
+    if self.fiducialArray == None:
+      self.fiducialArray = np.reshape([],(0,3))
+
     modifyFlag = fiducialNode.StartModify()
     # If configuring, only keep max two frames of scanline fiducials
     # if (SkullMarkerLogic.configuring == 1 and self.fiducialNode.GetNumberOfFiducials() >= len(
@@ -438,9 +465,37 @@ class SkullMarkerLogic(ScriptedLoadableModuleLogic):
       # Add bone surface point fiducial
       if boneSurfacePoint is not None:
         rasBoneSurfacePoint = ijkToRas.MultiplyPoint(boneSurfacePoint)
-        fiducialNode.AddFiducialFromArray(rasBoneSurfacePoint[:3])
+        rasBoneSurfacePoint = self.checkDistances(rasBoneSurfacePoint, self.fiducialArray)
+        if rasBoneSurfacePoint is not None:
+          self.fiducialArray = np.append(self.fiducialArray, [rasBoneSurfacePoint[:3]], axis=0)
+          fiducialNode.AddFiducialFromArray(rasBoneSurfacePoint[:3])
 
       fiducialNode.EndModify(modifyFlag)
+
+  def checkDistances(self, rasBoneSurfacePoint, fiducialArray):
+    tooCloseCheck = False
+    totalPointsSoFar = len(fiducialArray)
+    numChecked=0
+    while ((numChecked < totalPointsSoFar) and (tooCloseCheck==False)):
+      currentPoint = fiducialArray[numChecked]
+      distanceBetweenPoints = np.linalg.norm(currentPoint - rasBoneSurfacePoint[:3])
+
+      '''
+      distanceX = (rasBoneSurfacePoint[0] - currentPoint[0])*(rasBoneSurfacePoint[0]-currentPoint[0])
+      distanceY = (rasBoneSurfacePoint[1] - currentPoint[1])*(rasBoneSurfacePoint[1]-currentPoint[1])
+      distanceZ = (rasBoneSurfacePoint[2] - currentPoint[2])*(rasBoneSurfacePoint[2]-currentPoint[2])
+      distanceBetweenPoints = math.sqrt(distanceX+distanceY+distanceZ)
+      '''
+      if (distanceBetweenPoints<self.minDistanceBetween):
+        tooCloseCheck = True
+
+      else:
+        numChecked = numChecked + 1
+
+    if (tooCloseCheck == True):
+      return None
+    else:
+      return rasBoneSurfacePoint
 
   def scanlineBoneSurfacePoint(self, currentScanline, startPoint, endPoint, threshold):
     boneSurfacePoint = None
